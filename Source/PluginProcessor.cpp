@@ -39,8 +39,9 @@ void EncajeCarveAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
 {
     sr = sampleRate;
 
-    fifo.assign ((size_t) fftSize, 0.0f);
-    fifoIndex = 0;
+    ring.assign ((size_t) fftSize, 0.0f);
+    writeIndex = 0;
+    hopCounter = 0;
     fftData.assign ((size_t) fftSize * 2, 0.0f);
     bandEnergySmoothed.fill (0.0f);
 
@@ -114,25 +115,35 @@ void EncajeCarveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
     auto* left  = buffer.getWritePointer (0);
     auto* right = numChannels > 1 ? buffer.getWritePointer (1) : left;
 
-    // --- analisis: acumular una mezcla mono en el fifo circular y correr
-    // la FFT cada vez que se llena una ventana completa ---
+    // --- analisis: acumular una mezcla mono en un buffer circular y correr
+    // la FFT (solapada al 75%) cada vez que avanzamos un hop completo ---
     for (int i = 0; i < numSamples; ++i)
     {
         float mono = numChannels > 1 ? 0.5f * (left[i] + right[i]) : left[i];
-        fifo[(size_t) fifoIndex] = mono;
-        ++fifoIndex;
+        ring[(size_t) writeIndex] = mono;
+        writeIndex = (writeIndex + 1) % fftSize;
+        ++hopCounter;
 
-        if (fifoIndex >= fftSize)
+        if (hopCounter >= hopSize)
         {
-            fifoIndex = 0;
+            hopCounter = 0;
 
+            // linearizar el buffer circular en orden cronologico: writeIndex
+            // apunta justo a la muestra mas vieja (la proxima que se va a
+            // sobrescribir), asi que empezamos a leer desde ahi.
             std::fill (fftData.begin(), fftData.end(), 0.0f);
-            std::copy (fifo.begin(), fifo.end(), fftData.begin());
+            for (int k = 0; k < fftSize; ++k)
+            {
+                int idx = (writeIndex + k) % fftSize;
+                fftData[(size_t) k] = ring[(size_t) idx];
+            }
             window.multiplyWithWindowingTable (fftData.data(), (size_t) fftSize);
             fft.performFrequencyOnlyForwardTransform (fftData.data());
 
             std::array<float, encaje::kNumBands> bandEnergyRaw {};
+            std::array<int,   encaje::kNumBands> bandBinCount {};
             bandEnergyRaw.fill (0.0f);
+            bandBinCount.fill (0);
 
             for (int bin = 1; bin < fftSize / 2; ++bin)
             {
@@ -145,10 +156,19 @@ void EncajeCarveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
                     if (freq >= encaje::kBands[(size_t) b].lo && freq < encaje::kBands[(size_t) b].hi)
                     {
                         bandEnergyRaw[(size_t) b] += e;
+                        bandBinCount[(size_t) b] += 1;
                         break;
                     }
                 }
             }
+
+            // Energia PROMEDIO por bin (densidad espectral), no la suma total.
+            // Si no hicieramos esto, una banda ancha como Agudos (10 000 Hz de
+            // ancho) siempre "ganaria" frente a Sub (40 Hz de ancho) solo por
+            // tener muchisimos mas bins sumando, sin importar que tan fuerte
+            // suene realmente cada una. Promediar hace la comparacion justa.
+            for (int b = 0; b < encaje::kNumBands; ++b)
+                bandEnergyRaw[(size_t) b] /= (float) juce::jmax (1, bandBinCount[(size_t) b]);
 
             for (int b = 0; b < encaje::kNumBands; ++b)
                 bandEnergySmoothed[(size_t) b] = bandEnergySmoothed[(size_t) b] * 0.7f

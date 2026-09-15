@@ -1,0 +1,32 @@
+name: Build VST3 (Windows)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake + FetchContent JUCE)
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release --target EncajeCarve_VST3 --parallel
+
+      - name: List built VST3
+        shell: cmd
+        run: dir /s /b build\*.vst3
+
+      - name: Upload VST3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EncajeCarve-VST3-Windows
+          path: |
+            build/**/VST3/**
+          if-no-files-found: error

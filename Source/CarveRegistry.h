@@ -262,7 +262,7 @@ private:
         }
     }
 
-    juce::InterProcessLock ipLock;
+    mutable juce::InterProcessLock ipLock;
     std::unique_ptr<juce::MemoryMappedFile> mmf;
     SharedTable* table = nullptr;
 

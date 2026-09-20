@@ -187,9 +187,14 @@ void EncajeCarveAudioProcessor::analyseFrame()
 
     // presencia por banda: promedio por bin, para que una banda ancha no gane
     // solo por tener mas bins que sumar
+    // Suavizado mas lento de lo que parece necesario a primera vista: un
+    // kick sube y baja de energia varias veces por segundo, y si el reparto
+    // de bandas persigue eso en vivo, el "dueno" de una banda y el ajuste de
+    // los demas laten al ritmo del kick en vez de reflejar el balance
+    // sostenido de la mezcla, que es lo que realmente importa aqui.
     for (int b = 0; b < encaje::kNumBands; ++b)
-        bandEnergySmoothed[(size_t) b] = bandEnergySmoothed[(size_t) b] * 0.7f
-                                          + avgE[(size_t) b] * 0.3f;
+        bandEnergySmoothed[(size_t) b] = bandEnergySmoothed[(size_t) b] * 0.85f
+                                          + avgE[(size_t) b] * 0.15f;
 
     // --- rasgos (sobre energia total, que es lo perceptualmente relevante) ---
     float totalE = 0.0f;
@@ -284,12 +289,24 @@ void EncajeCarveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
     // mas de volumen. Si nadie ha tocado la Prioridad (todas en 0), hay un
     // solo nivel y el ajuste es 0 dB para todos: no hacer nada es lo
     // correcto hasta que el usuario decida un orden.
+    // Coeficiente de suavizado calculado a partir del TIEMPO real, no del
+    // numero de bloque. Un coeficiente fijo "por bloque" cambia de velocidad
+    // segun el buffer que use la DAW: con un buffer chico (128 muestras,
+    // muy comun en Studio One) un coeficiente de 0.07 por bloque equivale a
+    // reaccionar casi instantaneamente, y cualquier fluctuacion normal del
+    // audio se siente como un volumen inestable, subiendo y bajando todo el
+    // tiempo. Con este calculo, el tiempo de reaccion es siempre el mismo
+    // (aca, ~250 ms) sin importar el tamano de buffer.
+    const float smoothTimeConstantSec = 0.25f;
+    const float blockSeconds = (float) numSamples / (float) sr;
+    const float smoothCoeff = 1.0f - std::exp (-blockSeconds / smoothTimeConstantSec);
+
     float overallTargetDb = 0.0f;
     if (enabled && status.priorityTiers > 1)
         overallTargetDb = -maxCutDb * carveAmount
                             * ((float) status.priorityRank / (float) (status.priorityTiers - 1));
 
-    overallGainDbSmoothed += (overallTargetDb - overallGainDbSmoothed) * 0.12f;
+    overallGainDbSmoothed += (overallTargetDb - overallGainDbSmoothed) * smoothCoeff;
     uiOverallGainDb.store (overallGainDbSmoothed);
     const float overallGainLin = juce::Decibels::decibelsToGain (overallGainDbSmoothed);
 
@@ -302,7 +319,13 @@ void EncajeCarveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
         const auto& v = status.bands[(size_t) b];
         float targetDb = 0.0f;
 
-        const bool contested = v.competitors >= 2 && v.leaderClaim >= 0.40f;
+        // Hay banda disputada si existe un dueno claro (leaderClaim) y hay al
+        // menos otra pista viva en el grupo. OJO: no se exige que MI parte
+        // supere ningun porcentaje minimo aqui a proposito -- un sonido
+        // enterrado (con poca energia en esta banda) es justo el que
+        // necesita que lo suban, y exigirle un minimo de presencia para
+        // "calificar" era lo que le impedia recibir ese boost.
+        const bool contested = v.leaderClaim >= 0.40f && status.peerCount >= 2;
 
         // El dueno de la banda es el punto de referencia: nunca se toca.
         // A cada uno de los demas se le empuja hacia la SEPARACION OBJETIVO
@@ -328,7 +351,7 @@ void EncajeCarveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
         }
 
         auto& bf = bandFilters[(size_t) b];
-        bf.currentGainDb += (targetDb - bf.currentGainDb) * 0.12f;
+        bf.currentGainDb += (targetDb - bf.currentGainDb) * smoothCoeff;
 
         if (std::abs (bf.currentGainDb - bf.appliedGainDb) > 0.05f)
         {

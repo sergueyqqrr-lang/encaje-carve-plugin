@@ -79,6 +79,10 @@ struct SharedTable
 {
     juce::int32 magic = 0;
     SharedSlot slots[kMaxSlots];
+    // Quien fue el dueno de cada banda, por grupo, la ultima vez. Se usa
+    // para exigirle a un retador que gane con margen claro antes de
+    // arrebatarle el puesto al dueno actual (histeresis contra el parpadeo).
+    juce::int32 lastOwner[8][kNumBands];
 };
 #pragma pack(pop)
 
@@ -180,7 +184,7 @@ public:
         out.priorityRank  = rank;
         out.priorityTiers = juce::jmax (1, nTiers);
 
-        // --- veredictos por banda (igual que antes) ---
+        // --- veredictos por banda ---
         for (int b = 0; b < kNumBands; ++b)
         {
             float total = 0.0f;
@@ -191,8 +195,16 @@ public:
             BandVerdict v;
             if (total <= 1.0e-12f) { out.bands[(size_t) b] = v; continue; }
 
-            int   bestSlot = -1;
-            float bestScore = 0.0f;
+            // Se guarda el share, el claim y el score de cada pista activa
+            // para poder recuperar los del dueno anterior sin recorrer todo
+            // otra vez.
+            std::array<float, kMaxSlots> shareOf {};
+            std::array<float, kMaxSlots> claimOf {};
+            std::array<float, kMaxSlots> scoreOf {};
+            shareOf.fill (0.0f); claimOf.fill (0.0f); scoreOf.fill (0.0f);
+
+            int   challengerSlot  = -1;
+            float challengerScore = 0.0f;
 
             for (int i = 0; i < kMaxSlots; ++i)
             {
@@ -204,20 +216,50 @@ public:
                 const float claim = effectiveClaim (s, b);
                 const float score = claim * (0.35f + 0.65f * share);
 
-                if (share > 0.15f) v.competitors++;
+                shareOf[(size_t) i] = share;
+                claimOf[(size_t) i] = claim;
+                scoreOf[(size_t) i] = score;
 
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestSlot = i;
-                    v.leaderShare = share;
-                    v.leaderClaim = claim;
-                }
+                // OJO: contar por CLAIM (que tan propio de su tipo de sonido
+                // es esta banda), no por el volumen actual. Si se contara por
+                // volumen, un sonido enterrado (que es justo el que se
+                // necesita subir) nunca calificaria como "competidor" por
+                // tener poca energia ahora mismo, y jamas se le aplicaria el
+                // ajuste que lo saque del fondo de la mezcla.
+                if (claim >= 0.15f) v.competitors++;
 
-                if (i == slot) { v.share = share; v.myClaim = claim; }
+                if (score > challengerScore) { challengerScore = score; challengerSlot = i; }
+                if (i == slot) v.share = share;
             }
 
-            v.amDominant = (bestSlot == slot) || (bestSlot < 0);
+            // --- histeresis: el dueno anterior conserva el puesto salvo que
+            // el retador lo supere con margen claro. Sin esto, el dueno de
+            // una banda puede cambiar decenas de veces por segundo cada vez
+            // que, por ejemplo, un kick decae por debajo de un bajo
+            // sostenido, y cada cambio de dueno es un salto brusco de
+            // ganancia (el "sube y baja" inestable). ---
+            const float hysteresisMargin = 0.20f; // el retador debe ganar por 20%
+            int prevOwner = table->lastOwner[(size_t) group][(size_t) b];
+            bool prevOwnerStillValid = prevOwner >= 0
+                                        && table->slots[(size_t) prevOwner].active != 0
+                                        && table->slots[(size_t) prevOwner].group == group
+                                        && now - table->slots[(size_t) prevOwner].lastUpdateMs <= staleMs;
+
+            int finalOwner;
+            if (! prevOwnerStillValid || challengerSlot < 0)
+                finalOwner = challengerSlot;
+            else if (challengerScore > scoreOf[(size_t) prevOwner] * (1.0f + hysteresisMargin))
+                finalOwner = challengerSlot; // gano con margen claro: se lleva el puesto
+            else
+                finalOwner = prevOwner;      // se queda el dueno de antes
+
+            table->lastOwner[(size_t) group][(size_t) b] = finalOwner;
+
+            v.leaderShare = finalOwner >= 0 ? shareOf[(size_t) finalOwner] : 0.0f;
+            v.leaderClaim = finalOwner >= 0 ? claimOf[(size_t) finalOwner] : 0.0f;
+            v.myClaim     = claimOf[(size_t) slot];
+            v.amDominant  = (finalOwner == slot) || (finalOwner < 0);
+
             out.bands[(size_t) b] = v;
         }
     }
@@ -258,6 +300,9 @@ private:
                 // primera vez que se crea el archivo: limpiar todo
                 std::memset (table, 0, sizeof (SharedTable));
                 table->magic = 0x45434152;
+                for (auto& row : table->lastOwner)
+                    for (auto& v : row)
+                        v = -1;
             }
         }
     }
